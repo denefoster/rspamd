@@ -4,6 +4,41 @@ metadata:
   name: {{ include "rspamd.fullname" . }}
   labels: {{- include "rspamd.labels" . | nindent 4}}
 data:
+  rspamd.conf.local: |
+    jev {
+      .include "$LOCAL_CONFDIR/local.d/jev.conf"
+    }
+  jev.conf: |
+    # Include INSIDE a jev { ... } block; see README.md.
+    enabled = true;
+    mode = "live";
+    url = "https://api.typesafe.ai/v1/systemone";
+    model = "jev-1.14.0";
+    allow_external = true;
+    # Set an absolute path readable by Rspamd before switching to live mode.
+    api_key_file = "/var/lib/rspamd/jev.key";
+    recipient_domains = ["lists.sys.slush.ca"];
+
+    # Optional: require an existing gpt module result before querying Jev.
+    # false works with plain Rspamd; true requires GPT_CHECK and GPT_* results.
+    require_gpt = false;
+    sample_rate = 1.0;
+    timeout = 1.5;
+
+    # PER WORKER, not global. No retries or cache.
+    requests_per_second = 100;
+    max_inflight = 20;
+    cooldown = 60;
+
+    max_message_bytes = 1048576;
+    max_body_bytes = 6000;
+    max_request_bytes = 24576;
+    max_urls = 16;
+    max_attachments = 8;
+
+    # Only changes observation labels; never changes scores or actions.
+    probability_threshold = 0.9;
+    confidence_threshold = 0.9;
   spamtrap.conf: |
     enabled = true;
     action = "no action";

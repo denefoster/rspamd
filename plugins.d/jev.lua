@@ -400,7 +400,8 @@ local function check(task)
           reason, code or 0, api_error or 'no_api_error')
     else
       record.status, record.jev = 'ok', result
-      task:insert_result('JEV_' .. result.decision:upper(), 0.0,
+      -- Weight 1 applies the symbol score: 0 by default, overridable in groups.conf.
+      task:insert_result('JEV_' .. result.decision:upper(), 1.0,
           string.format('p=%.6f;confidence=%.6f', result.probabilities[result.choice], result.confidence))
     end
   end
