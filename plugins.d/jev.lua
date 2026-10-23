@@ -14,6 +14,8 @@ local settings = {
   model = 'jev-1.13.0',
   allow_external = false,
   api_key_file = '',
+  api_key_redis_key = '',
+  redis = {},
   recipient_domains = {},
   require_gpt = false,
   sample_rate = 0.05,
@@ -70,22 +72,32 @@ end
 if type(settings.model) ~= 'string' or not settings.model:match('^jev%-%d+%.%d+%.%d+$') then
   error('jev: pin a versioned model, for example jev-1.13.0')
 end
-if type(settings.url) ~= 'string' or type(settings.api_key_file) ~= 'string' then
-  error('jev: url and api_key_file must be strings')
+if type(settings.url) ~= 'string' or type(settings.api_key_file) ~= 'string'
+    or type(settings.api_key_redis_key) ~= 'string' then
+  error('jev: url, api_key_file and api_key_redis_key must be strings')
 end
+if type(settings.redis) ~= 'table' then error('jev: redis must be a section') end
 if type(settings.recipient_domains) ~= 'table' then
   error('jev: recipient_domains must be an array')
 end
-local domains = {}
+local domains, any_domain = {}, false
 for index, domain in pairs(settings.recipient_domains) do
-  if type(index) ~= 'number' or index % 1 ~= 0 or index < 1
-      or type(domain) ~= 'string' or not domain:match('^[%w][%w%.%-]*[%w]$') then
+  if type(index) ~= 'number' or index % 1 ~= 0 or index < 1 or type(domain) ~= 'string'
+      or (domain ~= '*' and not domain:match('^[%w][%w%.%-]*[%w]$')) then
     error('jev: invalid recipient_domains entry')
   end
-  domains[domain:lower()] = true
+  if domain == '*' then any_domain = true else domains[domain:lower()] = true end
+end
+if any_domain and #settings.recipient_domains ~= 1 then
+  error('jev: "*" must be the only recipient_domains entry')
 end
 
-local api_key
+local function valid_key(contents)
+  local key = type(contents) == 'string' and contents:match('^%s*(%S+)%s*$')
+  if key and #contents <= 4096 and not key:find('[%c]') then return key end
+end
+
+local api_key, redis_params
 if settings.mode == 'mock' then
   if not settings.url:match('^http://127%.0%.0%.1:%d+/v1/systemone$') then
     error('jev: mock mode only permits http://127.0.0.1:PORT/v1/systemone')
@@ -95,19 +107,27 @@ elseif settings.mode == 'live' then
   if settings.url ~= 'https://api.typesafe.ai/v1/systemone' then
     error('jev: live mode requires the official HTTPS endpoint')
   end
-  if not settings.allow_external or next(domains) == nil then
+  if not settings.allow_external or (not any_domain and next(domains) == nil) then
     error('jev: live mode requires allow_external and explicit recipient_domains')
   end
-  if settings.api_key_file:sub(1, 1) ~= '/' then
-    error('jev: live mode requires api_key_file (absolute path readable by Rspamd)')
+  if (settings.api_key_file == '') == (settings.api_key_redis_key == '') then
+    error('jev: live mode requires exactly one of api_key_file or api_key_redis_key')
   end
-  local file = io.open(settings.api_key_file, 'r')
-  if not file then error('jev: cannot read api_key_file') end
-  local contents = file:read(4097)
-  file:close()
-  api_key = contents and contents:match('^%s*(%S+)%s*$')
-  if not api_key or #contents > 4096 or api_key:find('[%c]') then
-    error('jev: api_key_file must contain one nonempty token')
+  if settings.api_key_redis_key ~= '' then
+    -- Nested section, so Redis options cannot collide with Jev's own (e.g. timeout).
+    redis_params = require('lua_redis').parse_redis_server(N, {redis = settings.redis})
+    if not redis_params then
+      error('jev: api_key_redis_key requires Redis servers in jev { redis {} } or redis {}')
+    end
+  else
+    if settings.api_key_file:sub(1, 1) ~= '/' then
+      error('jev: live mode requires api_key_file (absolute path readable by Rspamd)')
+    end
+    local file = io.open(settings.api_key_file, 'r')
+    if not file then error('jev: cannot read api_key_file') end
+    api_key = valid_key(file:read(4097))
+    file:close()
+    if not api_key then error('jev: api_key_file must contain one nonempty token') end
   end
 else
   error('jev: mode must be mock or live')
@@ -332,6 +352,7 @@ local function check(task)
     evidence_version = 'email-evidence-v2',
     sample_rate = settings.sample_rate,
     require_gpt = settings.require_gpt,
+    any_recipient_domain = any_domain,
     probability_threshold = settings.probability_threshold,
     confidence_threshold = settings.confidence_threshold,
     status = 'pending',
@@ -341,7 +362,7 @@ local function check(task)
     record.status, record.reason = 'skipped', reason
   end
   if task:get_user() then skip('authenticated'); return end
-  if settings.mode == 'live' or next(domains) ~= nil then
+  if not any_domain and (settings.mode == 'live' or next(domains) ~= nil) then
     local recipients = task:get_recipients('smtp') or {}
     if #recipients == 0 then skip('no_smtp_recipients'); return end
     for _, recipient in ipairs(recipients) do
@@ -359,6 +380,7 @@ local function check(task)
     return
   end
   if sample / 4294967296 >= settings.sample_rate then skip('sample'); return end
+  if not api_key then skip('no_api_key'); return end
   local now = util.get_time()
   if now < blocked_until then skip('circuit_open'); return end
   if inflight >= settings.max_inflight then skip('inflight_limit'); return end
@@ -426,6 +448,35 @@ local function check(task)
     end,
   })
   if not scheduled then complete('schedule_failed') end
+end
+
+local REDIS_KEY_REFRESH = 60
+local function read_redis_key(cfg, ev_base)
+  local function callback(err, data)
+    local key = not err and valid_key(data)
+    if not key then
+      -- Never log the value; a missing key arrives as non-string data.
+      logger.warnx(cfg, 'jev: cannot load API key from Redis (%s); keeping %s',
+          err and 'request_failed' or 'missing_or_invalid', api_key and 'previous key' or 'none')
+      return
+    end
+    if key ~= api_key then logger.infox(cfg, 'jev: loaded API key from Redis') end
+    api_key = key
+  end
+  local key = settings.api_key_redis_key
+  if not require('lua_redis').redis_make_request_taskless(ev_base, cfg, redis_params, key,
+      false, callback, 'GET', {key}) then
+    logger.warnx(cfg, 'jev: cannot schedule Redis API key request')
+  end
+end
+if redis_params then
+  rspamd_config:add_on_load(function(_, ev_base, worker)
+    if not worker:is_scanner() then return end
+    rspamd_config:add_periodic(ev_base, 0.0, function(cfg)
+      read_redis_key(cfg, ev_base)
+      return REDIS_KEY_REFRESH
+    end, true)
+  end)
 end
 
 local id = rspamd_config:register_symbol({

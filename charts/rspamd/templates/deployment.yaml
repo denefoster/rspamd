@@ -180,12 +180,14 @@ spec:
             - name: config
               mountPath: /etc/rspamd/local.d/spamtrap.conf
               subPath: spamtrap.conf
+            {{- if .Values.rspamd.jevEnabled }}
             - name: config
               mountPath: /etc/rspamd/local.d/jev.conf
               subPath: jev.conf
             - name: config
               mountPath: /etc/rspamd/rspamd.conf.local
               subPath: rspamd.conf.local
+            {{- end }}
             - name: logs
               mountPath: /var/log/rspamd
       {{- if .Values.filebeat.enabled }}

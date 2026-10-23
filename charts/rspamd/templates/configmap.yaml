@@ -4,20 +4,20 @@ metadata:
   name: {{ include "rspamd.fullname" . }}
   labels: {{- include "rspamd.labels" . | nindent 4}}
 data:
+{{- if .Values.rspamd.jevEnabled }}
   rspamd.conf.local: |
     jev {
       .include "$LOCAL_CONFDIR/local.d/jev.conf"
     }
   jev.conf: |
-    # Include INSIDE a jev { ... } block; see README.md.
     enabled = true;
     mode = "live";
     url = "https://api.typesafe.ai/v1/systemone";
     model = "jev-1.14.0";
     allow_external = true;
-    # Set an absolute path readable by Rspamd before switching to live mode.
-    api_key_file = "/var/lib/rspamd/jev.key";
-    recipient_domains = ["lists.sys.slush.ca"];
+    # set by read -rs JEV_KEY && printf '%s' "$JEV_KEY" | redis-cli -x SET jev_api_key; unset JEV_KEY
+    api_key_redis_key = "jev_api_key";
+    recipient_domains = ["*"];
 
     # Optional: require an existing gpt module result before querying Jev.
     # false works with plain Rspamd; true requires GPT_CHECK and GPT_* results.
@@ -37,8 +37,9 @@ data:
     max_attachments = 8;
 
     # Only changes observation labels; never changes scores or actions.
-    probability_threshold = 0.9;
-    confidence_threshold = 0.9;
+    probability_threshold = {{ .values.rspamd.jevProbabilityThreshold }};
+    confidence_threshold = {{ .values.rspamd.jevConfidenceThreshold }};
+{{- end }}
   spamtrap.conf: |
     enabled = true;
     action = "no action";
